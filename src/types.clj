@@ -1,6 +1,5 @@
 (ns types
-  (:require [clojure.core.logic :as l :refer [defne]]
-            [riddley.walk :refer [macroexpand-all]]))
+  (:require [clojure.core.logic :as l :refer [defne]]))
 
 (def
   ^{:doc "clojure.core.logic relation asserting that smaller is a subset of larger."
@@ -70,11 +69,11 @@
 (defn teval [env x result depth]
   (let [call (when (seq? x) (first x))]
     (cond
-      (or (number? x) (string? x))
+      (or (number? x) (string? x) (keyword? x))
      `(l/== ~result ~x)
 
-      (= 'fn* call)
-      (let [[_ [args & body]] x ; TODO: expand support to multi-arities
+      (= 'fn call)
+      (let [[_ args & body] x ; TODO: expand support to multi-arities
             nenv (gensym "nenv")
             r (gensym "r")]
        `(l/fresh [~@args ~r]
@@ -96,15 +95,21 @@
       (let [f (gensym "f")
             syms (mapv (fn [_] (gensym "e")) (rest x))]
        `(l/fresh [~f ~@syms]
-         ~(teval env (first x) f depth)
          ~@(map #(teval env %1 %2 depth) (rest x) syms)
-          (app ~f ~syms ~result ~depth)))
+          (app ~f ~syms ~result ~depth)
+         ~(teval env (first x) f depth)))
 
       (vector? x)
       (let [syms (mapv (fn [_] (gensym "e")) x)]
        `(l/fresh [~@syms]
          ~@(map #(teval env %1 %2 depth) x syms)
-          (l/== ~result [~@syms])))
+          (l/== ~result [:vec ~@syms])))
+
+      (map? x)
+      (let [key+syms (mapv (fn [[k v]] [v (gensym "e") k]) x)]
+       `(l/fresh [~@(map second key+syms)]
+         ~@(map #(teval env (first %) (second %) depth) key+syms)
+          (l/== ~result [:map ~@(mapcat (fn [[_ s k]] [k s]) key+syms)])))
 
       (symbol? x)
       (if-let [name (var-name env x)]
@@ -113,12 +118,14 @@
 
       :else (throw (new IllegalArgumentException (str "wtf is " x))))))
 
-(defmacro type [depth exp]
+(defmacro type
+ ([exp] `(types/type nil ~exp))
+ ([{:keys [n d] :or {n 1 d 3}} exp]
   (let [e (gensym "e")]
    `(with-regs
-      (first
-        (l/run 1 [~e]
-         ~(teval &env (macroexpand-all exp) e `(range ~depth)))))))
+      (doall
+        (l/run ~n [~e]
+         ~(teval &env exp e `(range ~d))))))))
 
 ; ######## RULES ########################
 ; #######################################
@@ -128,7 +135,7 @@
 (defne int-literal [a b _] ([x `int? _] (l/pred x int?)))
 (rule! int-literal)
 
-(defne int-is-num [a b d] ([`int? `number? d]))
+(defne int-is-num [a b _] ([`int? `number? _]))
 (rule! int-is-num)
 
 (defne float-literal [a b _] ([x `float? _] (l/pred x float?)))
@@ -142,6 +149,11 @@
 
 (defne ratio-is-num [a b _] ([`ratio? `number? _]))
 (rule! ratio-is-num)
+
+(defne literalo [x]
+  ([x] (l/pred x number?))
+  ([x] (l/pred x keyword?))
+  ([x] (l/pred x string?)))
 
 ; Rules: functions
 
@@ -183,16 +195,58 @@
 
 ; Rules: maps & structural
 
+; Operations below apply to a map as vector of [k1 v1 kv v2 ...]
+(defne assoco [input-map key val output-map]
+  ([[] k v [k v]])
+  ([[k _ . kv] k v [k v . kv]])
+  ([[k1 v1 . m1] k v [k1 v1 . m2]]
+    (assoco m1 k v m2)))
+
+(l/defne geto [map key value]
+  ([[k v . _] k v])
+  ; If I remove this rule I can force the map to contain the expected value, which is in
+  ; many cases what you'd want.
+  ([[] _ nil]) 
+  ([[nk _ . m] k v] (l/!= nk k) (geto m k v)))
+
+(defn every-kv? [m kpred vpred]
+  (and (every? kpred (keys m)) (every? vpred (vals m))))
+
+(defne every-kvo [map kp vp depth]
+  ([[] _ _ _])
+  ([[k v . m] kp vp [_ . d]]
+    (sub k kp d)
+    (sub v vp d)
+    (every-kvo m kp vp d)))
+
+(defne map-as-every-kv [a b depth]
+  ([[:map . m] [`every-kv? kp vp] d] (every-kvo m kp vp d)))
+(rule! map-as-every-kv)
+
+(defne homogeneous-map [a b depth]
+ ([[`every-kv? lk lv] [`every-kv? rk rv] [_ . d]]
+  (sub rk lk d)
+  (sub lv rv d)))
+(rule! homogeneous-map)
+
+; Nullability
+; TODO: ideally this would be expressed as union type
+
 ; Clojure core functions
 
-(set-type! #'+ (l/fne [_] ([[:fn [`int? `int?] `int? . nil]]) ([[:fn [`number? `number?] `number? . nil]])))
-(set-type! #'/ (l/fne [_] ([[:fn [`number?] `number? . nil]]) ([[:fn [`number? `number?] `number? . nil]])))
+(set-type! #'+ (l/fne [_] ([[:fn [`int? `int?] `int? . nil]])
+                          ([[:fn [`number? `number?] `number? . nil]])))
+(set-type! #'/ (l/fne [_] ([[:fn [`number?] `number? . nil]])
+                          ([[:fn [`number? `number?] `number? . nil]])))
 (set-type! #'inc (l/fne [_] ([[:fn [`int?] `int? . nil]])))
 
 (set-type! #'identity (l/fne [_] ([[:fn [a] a . nil]])))
 (set-type! #'constantly (l/fne [_] ([[:fn [a] [:fn [_] a . nil] . nil]])))
 
 (set-type! #'map (l/fne [_] ([[:fn [[:fn [a] b . nil] [`every? a '% . nil]] [`every? b '% . nil] . nil]])))
-(set-type! #'first (l/fne [_] ([[:fn [[`every? a '% . nil]] a . nil]]) ([[:fn [[:vector a . _]] a . nil]])))
-(set-type! #'second (l/fne [_] ([[:fn [[:vector _ . a . _]] a . nil]])))
+(set-type! #'first (l/fne [_] ([[:fn [[`every? a '% . nil]] a . nil]])))
 (set-type! #'rest (l/fne [_] ([[:fn [[`every? a '% . nil]] [`every? a '% . nil] . nil]])))
+
+(set-type! #'assoc (l/fne [_] ([[:fn [[:map . m1] k v] [:map . m2] . nil]] (literalo k) (assoco m1 k v m2))))
+(set-type! #'get (l/fne [_] ([[:fn [[:map . m] k] v . nil]] (literalo k) (geto m k v))
+                            ([[:fn [[`every-kv? k v . nil] k] [:or v nil] . nil]])))
