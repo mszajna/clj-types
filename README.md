@@ -24,3 +24,11 @@ The type checker is highly experimental.
 - very few `clojure.core` functions have been annotated (`+`, `inc`, `identity`, `map`),
 - permitted literals are limited to numbers
 - failure to type check sometimes manifests as an infinite loop.
+
+## On indicating the location of type check failures
+
+```clojure
+(fn [m]
+  (let [x (get m :a)]
+    (inc x)))
+```
